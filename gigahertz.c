@@ -12,39 +12,69 @@
 #include <sys/timerfd.h>
 
 typedef struct {
-    Display *display;
+    int w;
+    int h;
+    Display *dsp;
+    Window root;
+    int screen;
+} Gigahertz;
+
+Gigahertz* gh_initialize(Display *dsp, Window root, int screen, int w, int h)
+{
+    Gigahertz *gh = malloc(sizeof(Gigahertz));
+
+    gh->w = w;
+    gh->h = h;
+    gh->dsp = dsp;
+    gh->root = root;
+    gh->screen = screen;
+
+    return gh;
+}
+
+static Display *display;
+static Gigahertz *ghwm;
+
+typedef struct {
+    int h;
     Window window;
     XftDraw *xft_draw;
     XftColor *color;
     XftFont *font;
-} StatusBar;
+} Statusbar;
 
-StatusBar* StatusBar_Create(Display *display, Window window)
+
+static Statusbar *statusbar;
+
+Statusbar* statusbar_initialize()
 {
+    int height = 40;
+
+    Window window = XCreateSimpleWindow(display, ghwm->root, 0, 0, ghwm->w, height, 2,
+                                       BlackPixel(display, ghwm->screen),
+                                       WhitePixel(display, ghwm->screen));
 	XftDraw *draw;
     XftColor *color;
     XftFont *font;
 	Colormap colorMap;
 	Visual *visual;
     const char *fontName = "Liberation Mono-16:style=Bold";
-    StatusBar *bar;
+    Statusbar *bar;
 
-    int screen = XDefaultScreen(display);
-
-    visual = XDefaultVisual(display, screen);
-    colorMap = XDefaultColormap(display, screen);
+    visual = XDefaultVisual(ghwm->dsp, ghwm->screen);
+    colorMap = XDefaultColormap(ghwm->dsp, ghwm->screen);
 	
-    draw = XftDrawCreate(display, window, visual, colorMap);
+    draw = XftDrawCreate(ghwm->dsp, window, visual, colorMap);
 
     XRenderColor render_color = { .red=0x0000, .green=0x0000, .blue=0x0000, .alpha=0xffff };
     color = malloc(sizeof(XftColor));
-    XftColorAllocValue(display, visual, colorMap, &render_color, color);
+    XftColorAllocValue(ghwm->dsp, visual, colorMap, &render_color, color);
 
-    font = XftFontOpenName(display, screen, fontName);
+    font = XftFontOpenName(ghwm->dsp, ghwm->screen, fontName);
 
-    bar = malloc(sizeof(StatusBar));
+    bar = malloc(sizeof(Statusbar));
     
-    bar->display = display;
+    bar->h = height;
     bar->window = window;
     bar->xft_draw = draw;
     bar->color = color;
@@ -53,7 +83,7 @@ StatusBar* StatusBar_Create(Display *display, Window window)
     return bar;
 }
 
-void StatusbarUIDrawCurrenttime(StatusBar *bar)
+void statusbar_draw_currenttime()
 {
     char out_buffer[50];
     char with_format[50];
@@ -67,74 +97,101 @@ void StatusbarUIDrawCurrenttime(StatusBar *bar)
 
     strftime(out_buffer, sizeof(out_buffer), with_format, timeinfo);
 
-    XClearWindow(bar->display, bar->window);
+    XClearWindow(ghwm->dsp, statusbar->window);
 
-    int y = bar->font->ascent;
+    int text_baseline = (statusbar->h + statusbar->font->ascent - statusbar->font->descent) / 2;
 
-    XftDrawString8(bar->xft_draw, bar->color, bar->font, 100, 50, (FcChar8*) out_buffer, strlen(out_buffer));
+    XftDrawString8(statusbar->xft_draw, statusbar->color, statusbar->font, 10, text_baseline, (FcChar8*) out_buffer, strlen(out_buffer));
 }
 
-void StatusbarUIDraw(StatusBar *bar)
+void statusbar_draw()
 {
-    StatusbarUIDrawCurrenttime(bar);
+    statusbar_draw_currenttime();
 }
 
-int main() {
+void setup()
+{
+    int screen = DefaultScreen(display);
+    int dpw = XDisplayWidth(display, screen);
+    int dph = XDisplayHeight(display, screen);
 
-    int screenWidth = 3840;
-    int screenHeight = 2160;
-
-    setlocale(LC_ALL, "");
-
-    Display *display = XOpenDisplay(NULL);
-    if (display == NULL) {
-        fprintf(stderr, "Cannot open display\n");
-        return 1;
-    }
-
-    int screen_num = DefaultScreen(display);
-    Window root = RootWindow(display, screen_num);
-
-    // Create window
-    Window win = XCreateSimpleWindow(display, root, 0, 0, screenWidth, screenHeight, 2,
-                                       BlackPixel(display, screen_num),
-                                       WhitePixel(display, screen_num));
+    Window root = RootWindow(display, screen);
     
-    // Select input events
-    XSelectInput(display, win, ExposureMask | KeyPressMask | StructureNotifyMask);
+    ghwm = gh_initialize(display, root, screen, dpw, dph);
 
-    // Cursor
     Cursor cursor = XCreateFontCursor(display, XC_cross);
-    XStoreName(display, win, "X11 test window");
-    // Map (show) window
-    XMapRaised(display, win);
-    XSetInputFocus(display, win, RevertToParent, CurrentTime);
-    XDefineCursor(display, win, cursor);
-    XFlush(display);
-
-    StatusBar *statusBar;
+    XDefineCursor(display, root, cursor);
     
-    statusBar = StatusBar_Create(display, win);
+    XSelectInput(display, root, ExposureMask | KeyPressMask | StructureNotifyMask | SubstructureNotifyMask);
+}
 
+void setup_statusbar()
+{
+    statusbar = statusbar_initialize();
+
+    XMapWindow(display, statusbar->window);
+}
+
+static int ui_epoll_fd;
+static int ui_tick_fd;
+
+void ui_tick_setup()
+{
     // Non-blocking UI refresh
-    int ui_epoll_fd;
     struct epoll_event ui_epoll_ev;
-    struct epoll_event ui_timer_events[1];
-    int ui_timer_fd;
 
     struct itimerspec timer = {
         .it_interval = {1, 0},
         .it_value = {1, 0}
     };
 
-    ui_timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
-    timerfd_settime(ui_timer_fd, 0, &timer, NULL);
+    ui_tick_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    timerfd_settime(ui_tick_fd, 0, &timer, NULL);
     
     ui_epoll_fd = epoll_create1(0);
     ui_epoll_ev.events = EPOLLIN;
-    ui_epoll_ev.data.fd = ui_timer_fd;
+    ui_epoll_ev.data.fd = ui_tick_fd;
 
-    epoll_ctl(ui_epoll_fd, EPOLL_CTL_ADD, ui_timer_fd, &ui_epoll_ev);
+    epoll_ctl(ui_epoll_fd, EPOLL_CTL_ADD, ui_tick_fd, &ui_epoll_ev);
+}
+
+void ui_tick_stop()
+{
+    close(ui_epoll_fd);
+    close(ui_tick_fd);
+}
+
+int ui_ticked()
+{
+    int nevents;
+    struct epoll_event ui_timer_events[1];
+
+    nevents = epoll_wait(ui_epoll_fd, ui_timer_events, 1, -1);
+    if (nevents && ui_timer_events[0].data.fd == ui_tick_fd) {
+        int64_t expirations;
+        read(ui_tick_fd, &expirations, sizeof(expirations));
+
+        return 1;
+    }
+
+    return 0;
+}
+
+int main() {
+
+    setlocale(LC_ALL, "");
+
+    display = XOpenDisplay(NULL);
+    if (display == NULL) {
+        fprintf(stderr, "Cannot open display\n");
+        return 1;
+    }
+
+    setup();
+
+    setup_statusbar();
+
+    ui_tick_setup();
 
     // Event loop
     XEvent ev;
@@ -154,47 +211,45 @@ int main() {
         			    run = 0;
         		    }
         
-        		    if (key == XK_c) {
-        			    Window win2 = XCreateSimpleWindow(
-                                display, 
-                                root, 
-                                200, 200, 
-                                400, 200, 
-                                2,
-        					    BlackPixel(display, screen_num),
-        					    WhitePixel(display, screen_num));
-        			    XMapRaised(display, win2);
-        			    XFlush(display);
+        		    if (key == XK_1) {
+                        if (fork() == 0) {
+                            execlp("alacritty", "alacritty", NULL);
+                        }
         		    }
                     break;
         
         	    case Expose:
-        		    StatusbarUIDraw(statusBar);
+        		    statusbar_draw();
                     XFlush(display);
                     break;
-        
-        	    case MapNotify:
-        	       XClearWindow(display, win);
-           	       XFlush(display);
-        	       break;	   
+
+                case MapRequest:
+                    XMapWindow(display, ev.xmaprequest.window);
+                    break;
+
+                case MapNotify:
+                    Window target = ev.xmap.window;
+                    if (target != statusbar->window) {
+                        XMoveResizeWindow(ghwm->dsp, target, 0, statusbar->h, ghwm->w, ghwm->h);
+                        XSetInputFocus(ghwm->dsp, target, RevertToParent, CurrentTime);
+                    }
+                    XFlush(ghwm->dsp);
+        	        break;
         	}
         }
-        
-        int nevents = epoll_wait(ui_epoll_fd, ui_timer_events, 1, -1);
-        if (nevents && ui_timer_events[0].data.fd == ui_timer_fd) {
-            uint64_t expirations;
-            read(ui_timer_fd, &expirations, sizeof(expirations));
-            StatusbarUIDraw(statusBar);
-            XFlush(display);
-        }
-       
+    
+        if (ui_ticked()) {
+            statusbar_draw();
 
+            XFlush(display);
+        } 
     }
 
     // Cleanup
-    XDestroyWindow(display, win);
     XCloseDisplay(display);
-    close(ui_timer_fd);
-    close(ui_epoll_fd);
+    free(statusbar);
+    free(ghwm);
+    ui_tick_stop();
+
     return 0;
 }
