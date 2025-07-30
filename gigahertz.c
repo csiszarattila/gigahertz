@@ -17,7 +17,20 @@ typedef struct {
     Display *dsp;
     Window root;
     int screen;
+    int running;
 } Gigahertz;
+
+void onMapRequest(XEvent *e);
+void onExpose (XEvent *e);
+void onMapNotify(XEvent *e);
+void onKeyPressed(XEvent *e);
+
+static void (*handlers[LASTEvent]) (XEvent *) = {
+    [Expose] = onExpose,
+    [MapRequest] = onMapRequest,
+    [MapNotify] = onMapNotify,
+    [KeyPress] = onKeyPressed
+};
 
 Gigahertz* gh_initialize(Display *dsp, Window root, int screen, int w, int h)
 {
@@ -28,6 +41,7 @@ Gigahertz* gh_initialize(Display *dsp, Window root, int screen, int w, int h)
     gh->dsp = dsp;
     gh->root = root;
     gh->screen = screen;
+    gh->running = 1;
 
     return gh;
 }
@@ -177,6 +191,47 @@ int ui_ticked()
     return 0;
 }
 
+void onExpose(XEvent *e)
+{
+    statusbar_draw();
+
+    XFlush(display);
+}
+
+void onMapRequest(XEvent *e)
+{
+    XMapWindow(display, e->xmaprequest.window);
+}
+
+void onMapNotify(XEvent *e)
+{
+    XMapEvent event = e->xmap;
+ 
+    if (event.window != statusbar->window) {
+        XMoveResizeWindow(ghwm->dsp, event.window, 0, statusbar->h, ghwm->w, ghwm->h);
+        XSetInputFocus(ghwm->dsp, event.window, RevertToParent, CurrentTime);
+    }
+
+    XFlush(ghwm->dsp);
+}
+
+void onKeyPressed(XEvent *e)
+{
+    XKeyEvent event = e->xkey;
+
+	KeySym key = XLookupKeysym(&event, 0);
+       		    
+    if (key == XK_Escape) {
+        ghwm->running = 0;
+    }
+ 
+    if (key == XK_1) {
+        if (fork() == 0) {
+            execlp("alacritty", "alacritty", NULL);
+        }
+    }
+}
+
 int main() {
 
     setlocale(LC_ALL, "");
@@ -191,51 +246,21 @@ int main() {
 
     setup_statusbar();
 
+    XFlush(display);
+
     ui_tick_setup();
 
     // Event loop
     XEvent ev;
 
-    int run = 1;
-
-    while (run) {
+    while (ghwm->running) {
 
         while(XPending(display)) {
             XNextEvent(display, &ev);
-    	
-        	switch (ev.type) {
-                case KeyPress:
-        		    KeySym key = XLookupKeysym(&ev.xkey, 0);
-        		    
-                    if (key == XK_Escape) {
-        			    run = 0;
-        		    }
-        
-        		    if (key == XK_1) {
-                        if (fork() == 0) {
-                            execlp("alacritty", "alacritty", NULL);
-                        }
-        		    }
-                    break;
-        
-        	    case Expose:
-        		    statusbar_draw();
-                    XFlush(display);
-                    break;
-
-                case MapRequest:
-                    XMapWindow(display, ev.xmaprequest.window);
-                    break;
-
-                case MapNotify:
-                    Window target = ev.xmap.window;
-                    if (target != statusbar->window) {
-                        XMoveResizeWindow(ghwm->dsp, target, 0, statusbar->h, ghwm->w, ghwm->h);
-                        XSetInputFocus(ghwm->dsp, target, RevertToParent, CurrentTime);
-                    }
-                    XFlush(ghwm->dsp);
-        	        break;
-        	}
+    
+            if (handlers[ev.type]) {
+                handlers[ev.type](&ev);
+            }
         }
     
         if (ui_ticked()) {
